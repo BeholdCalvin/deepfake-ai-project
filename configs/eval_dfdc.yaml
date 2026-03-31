@@ -1,0 +1,7 @@
+data_dir: "./data/processed/test"
+sequence_length: 5
+image_size: 224
+batch_size: 16
+device: "cuda"
+num_workers: 4
+weights_path: "weights/deepfake_model_ep8.pth"
