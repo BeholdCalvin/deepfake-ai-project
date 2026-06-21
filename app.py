@@ -37,7 +37,7 @@ from utils.face_extractor import FaceExtractor
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-WEIGHTS_PATH   = "weights/deepfake_model_ep9.pth"
+WEIGHTS_PATH   = "weights/deepfake_model_ep8.pth"
 SEQ_LENGTH     = 8
 IMG_SIZE       = 224
 DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")

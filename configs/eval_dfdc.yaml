@@ -4,4 +4,4 @@ image_size: 224
 batch_size: 16
 device: "cuda"
 num_workers: 4
-weights_path: "weights/deepfake_model_ep8.pth"
+weights_path: "weights/best_model.pth"
