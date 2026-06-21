@@ -271,3 +271,101 @@ class DeepfakeDetector(nn.Module):
 
         logits = self.classifier(out)                                  # [B, 1]
         return logits.squeeze(1)                                       # [B]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint compatibility
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A transitional version of this file assigned Grad-CAM target-layer
+# references as plain attributes, e.g.:
+#     self.gradcam_target_layer = self.backbone.conv_head
+# nn.Module.__setattr__ auto-registers any nn.Module-valued attribute as a
+# NAMED CHILD, so any checkpoint saved while that version was active contains
+# a SECOND, redundant copy of those weights under the alias path (e.g.
+# "gradcam_target_layer.weight") in addition to the real path
+# ("backbone.conv_head.weight").  The current model (using object.__setattr__,
+# see __init__ above) has no such keys, so a strict load_state_dict() on an
+# old checkpoint raises "Unexpected key(s)".
+#
+# The fix here is intentionally narrow: strip ONLY these known alias
+# prefixes, then load with strict=True for everything else.  A blanket
+# strict=False would also silently swallow genuine shape/architecture
+# mismatches — exactly the kind of bug you want loud, not hidden.
+
+_LEGACY_GRADCAM_ALIAS_PREFIXES: tuple[str, ...] = (
+    "gradcam_target_layer.",
+    "gradcam_spatial_layer.",
+    "gradcam_fft_layer.",
+    "fft_branch.gradcam_target.",
+)
+
+
+def strip_legacy_gradcam_alias_keys(state_dict: dict) -> dict:
+    """
+    Remove duplicate Grad-CAM alias weights left behind by the transitional
+    buggy version of DeepfakeDetector (see module-level comment above).
+
+    Safe no-op on checkpoints that never had these keys — every key with a
+    different prefix passes through unchanged.  Returns a NEW dict; never
+    mutates the input, so the raw checkpoint object remains untouched for
+    debugging if needed.
+
+    Args:
+        state_dict: Raw dict loaded via torch.load(..., weights_only=True).
+
+    Returns:
+        A copy of state_dict with legacy alias keys removed.
+    """
+    cleaned: dict = {}
+    removed: list[str] = []
+
+    for key, value in state_dict.items():
+        if key.startswith(_LEGACY_GRADCAM_ALIAS_PREFIXES):
+            removed.append(key)
+            continue
+        cleaned[key] = value
+
+    if removed:
+        print(
+            f"[DeepfakeDetector] Discarded {len(removed)} legacy Grad-CAM "
+            f"alias key(s) from checkpoint (duplicate weights, safe to drop): "
+            f"{removed}"
+        )
+
+    return cleaned
+
+
+def load_checkpoint(
+    model: "DeepfakeDetector",
+    checkpoint_path: str,
+    device: torch.device,
+) -> "DeepfakeDetector":
+    """
+    Load a .pth checkpoint into `model` with legacy-alias compatibility.
+
+    This is the SINGLE place checkpoint-loading logic lives; app.py,
+    predict.py, and evaluate.py all call this instead of duplicating
+    torch.load + load_state_dict, so a future fix to checkpoint handling
+    only needs to happen once.
+
+    Args:
+        model:           A freshly-constructed DeepfakeDetector (correct
+                         architecture; weights will be overwritten).
+        checkpoint_path: Path to a .pth file saved via torch.save(model.state_dict()).
+        device:          Device to map the checkpoint tensors onto.
+
+    Returns:
+        The same `model` instance, with weights loaded and set to eval().
+
+    Raises:
+        RuntimeError: if the checkpoint has any UNEXPECTED or MISSING key
+                      beyond the known legacy aliases — a genuine
+                      architecture mismatch should still fail loudly.
+    """
+    raw_state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    cleaned_state_dict = strip_legacy_gradcam_alias_keys(raw_state_dict)
+
+    model.load_state_dict(cleaned_state_dict, strict=True)
+    model.eval()
+    return model

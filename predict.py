@@ -26,7 +26,7 @@ from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
 from dataloaders.transforms import get_val_transforms
-from models.fusion import DeepfakeDetector
+from models.fusion import DeepfakeDetector, load_checkpoint
 from utils.face_extractor import FaceExtractor
 
 
@@ -104,19 +104,48 @@ class DualBranchGradCAM:
     • Frequency CAM : highlights where periodic spectral fingerprints drove the
       decision – GAN up-sampling grids, JPEG ring artefacts at specific spatial
       loci.  Anchored at model.gradcam_fft_layer (FFTBranch last Conv2d).
-    • Blending (65 % spatial + 35 % frequency) gives a richer explanation than
-      either branch alone while keeping the face region as the primary anchor.
+
+    Dynamic, per-sample blend weight (NOT a fixed prior)
+    ──────────────────────────────────────────────────────
+    A static 65/35 blend is misleading: for any given image the network may
+    have relied almost entirely on one branch, and a fixed prior would hide
+    that.  Instead, _compute_branch_weights() measures each branch's ACTUAL
+    contribution to this specific prediction via a Grad×Input attribution at
+    the fusion boundary:
+
+      1. A forward hook on `model.fusion_fc` captures its input tensor –
+         the concatenation cat([spatial_1792, freq_512]) – with
+         `.retain_grad()` enabled.
+      2. backward() on the logit propagates a gradient into that captured
+         tensor.
+      3. |gradient * activation|, summed separately over the spatial slice
+         (first 1792 dims) and the frequency slice (last 512 dims), gives a
+         magnitude-aware estimate of how much each branch's features moved
+         the final logit for THIS sample.
+      4. The two scores are normalised to sum to 1.0 and used as the blend
+         weight – so a sample where the model leaned 90 % on the frequency
+         branch is correctly blended 90/10, not forced into 65/35.
+
+    This is the standard "Gradient × Input" attribution method, applied at
+    the fusion layer instead of at input pixels — cheap (one extra
+    forward+backward) and model-agnostic given the branch dimensions exposed
+    on DeepfakeDetector (SPATIAL_DIM, FFT_DIM).
 
     Implementation note
     ────────────────────
-    Two independent GradCAM instances share the same model but hook different
-    layers.  Each generate() call performs exactly two forward+backward passes.
-    pytorch-grad-cam resets its activation / gradient lists at the start of
-    every __call__, so the two passes are fully independent despite shared hooks.
+    Three independent forward+backward passes run per generate() call: one
+    for branch-weight attribution, one for the spatial CAM, one for the FFT
+    CAM.  pytorch-grad-cam resets its own activation/gradient buffers at the
+    start of every __call__, and model.zero_grad() is called between passes,
+    so none of the three interfere with each other.
     """
 
-    SPATIAL_WEIGHT: float = 0.65
-    FFT_WEIGHT:     float = 0.35
+    # Fallback prior used ONLY if gradient-based attribution degenerates
+    # (e.g. a zero-gradient edge case on a saturated logit).  Not used in
+    # the normal path — kept so generate() never has to return without a
+    # usable blend.
+    _FALLBACK_SPATIAL_WEIGHT: float = 0.65
+    _FALLBACK_FFT_WEIGHT:     float = 0.35
 
     def __init__(self, model: DeepfakeDetector, device: torch.device) -> None:
         if not hasattr(model, "gradcam_spatial_layer"):
@@ -128,6 +157,12 @@ class DualBranchGradCAM:
             raise AttributeError(
                 "model.gradcam_fft_layer not found. "
                 "Ensure fusion.py is the updated version exposing both CAM anchors."
+            )
+        if not hasattr(model, "fusion_fc"):
+            raise AttributeError(
+                "model.fusion_fc not found. Branch-weight attribution hooks "
+                "the fusion_fc input tensor; this requires the standard "
+                "DeepfakeDetector architecture from fusion.py."
             )
 
         self.model  = model
@@ -151,24 +186,86 @@ class DualBranchGradCAM:
         vmax = float(cam.max())
         return cam / (vmax + 1e-8) if vmax > 0 else cam
 
-    def generate(self, input_tensor: torch.Tensor) -> dict[str, np.ndarray]:
+    def _compute_branch_weights(self, input_tensor: torch.Tensor) -> tuple[float, float]:
         """
-        Compute Grad-CAM overlays for both branches and return all three views.
+        Measure each branch's real contribution to this prediction via
+        Grad×Input attribution at the fusion boundary (see class docstring).
+
+        Args:
+            input_tensor: [1, C, H, W] single frame, already on self.device.
+
+        Returns:
+            (spatial_weight, fft_weight) – non-negative floats summing to 1.0.
+        """
+        captured: dict[str, torch.Tensor] = {}
+
+        def _capture_fused_input(module, inputs, output):
+            # inputs[0] is the tensor passed INTO fusion_fc, i.e. exactly
+            # cat([spatial_features, freq_features], dim=1) — see
+            # DeepfakeDetector._extract_frame_features in fusion.py.
+            fused = inputs[0]
+            fused.retain_grad()   # fused is a non-leaf tensor; grad isn't
+            captured["fused"] = fused  # kept by default without retain_grad()
+
+        handle = self.model.fusion_fc.register_forward_hook(_capture_fused_input)
+        try:
+            self.model.zero_grad(set_to_none=True)
+            logits = self.model(input_tensor)        # [1] – single-image path
+            logits.sum().backward()
+        finally:
+            handle.remove()
+
+        fused_act  = captured["fused"].detach()       # [1, 2304]
+        fused_grad = captured["fused"].grad           # [1, 2304] or None
+
+        # Always clear parameter grads afterwards so this attribution pass
+        # never leaks gradient state into the CAM passes that follow.
+        self.model.zero_grad(set_to_none=True)
+
+        if fused_grad is None:
+            return self._FALLBACK_SPATIAL_WEIGHT, self._FALLBACK_FFT_WEIGHT
+
+        contribution = (fused_grad * fused_act).abs()[0]          # [2304]
+        spatial_score = contribution[: DeepfakeDetector.SPATIAL_DIM].sum().item()
+        fft_score     = contribution[DeepfakeDetector.SPATIAL_DIM:].sum().item()
+        total         = spatial_score + fft_score
+
+        if total <= 1e-12:
+            # Degenerate case: essentially zero gradient reached the fusion
+            # boundary (e.g. a fully saturated sigmoid).  Fall back rather
+            # than divide by ~0 and produce a meaningless weight.
+            return self._FALLBACK_SPATIAL_WEIGHT, self._FALLBACK_FFT_WEIGHT
+
+        return spatial_score / total, fft_score / total
+
+    def generate(self, input_tensor: torch.Tensor) -> dict[str, object]:
+        """
+        Compute Grad-CAM overlays for both branches, blended using each
+        branch's measured contribution to this specific prediction.
 
         Args:
             input_tensor: [1, C, H, W] single frame (any device).
 
         Returns:
-            dict with three HWC uint8 RGB overlay images:
-              'combined' – weighted blend (primary display)
-              'spatial'  – EfficientNet-B4 spatial branch only
-              'fft'      – FFT frequency branch only
+            dict with:
+              'combined'       – HWC uint8 RGB, dynamically-weighted blend
+              'spatial'        – HWC uint8 RGB, spatial branch only
+              'fft'            – HWC uint8 RGB, frequency branch only
+              'spatial_weight' – float in [0, 1], this sample's spatial share
+              'fft_weight'     – float in [0, 1], this sample's frequency share
         """
         inp     = input_tensor.to(self.device)
         targets = [BinaryOutputTarget()]
 
-        # Two independent passes: each GradCAM resets its activation / gradient
-        # buffers at call time, so results are always fresh and non-interfering.
+        # 1) Measure actual per-sample branch contribution BEFORE running the
+        #    CAM passes, so this pass's backward() can't be confused with
+        #    GradCAM's internal backward calls.
+        self.model.eval()
+        spatial_weight, fft_weight = self._compute_branch_weights(inp)
+
+        # 2) Two independent CAM passes: each GradCAM resets its activation /
+        #    gradient buffers at call time, so results are fresh and
+        #    non-interfering despite sharing the same underlying model.
         with torch.enable_grad():
             spatial_raw = self._spatial_cam(input_tensor=inp, targets=targets)[0]
             fft_raw     = self._fft_cam(input_tensor=inp,     targets=targets)[0]
@@ -176,18 +273,19 @@ class DualBranchGradCAM:
         spatial_norm = self._normalise(spatial_raw)
         fft_norm     = self._normalise(fft_raw)
 
-        # Weighted blend: spatial has higher resolution and is more directly
-        # interpretable on a face image, so it gets the dominant weight.
+        # Blend using the MEASURED contribution, not a fixed prior.
         combined = self._normalise(
-            self.SPATIAL_WEIGHT * spatial_norm + self.FFT_WEIGHT * fft_norm
+            spatial_weight * spatial_norm + fft_weight * fft_norm
         )
 
         rgb_float = _tensor_to_rgb_numpy(inp.squeeze(0).cpu())  # float32 [0,1]
 
         return {
-            "combined": show_cam_on_image(rgb_float, combined,     use_rgb=True),
-            "spatial":  show_cam_on_image(rgb_float, spatial_norm, use_rgb=True),
-            "fft":      show_cam_on_image(rgb_float, fft_norm,     use_rgb=True),
+            "combined":       show_cam_on_image(rgb_float, combined,     use_rgb=True),
+            "spatial":        show_cam_on_image(rgb_float, spatial_norm, use_rgb=True),
+            "fft":            show_cam_on_image(rgb_float, fft_norm,     use_rgb=True),
+            "spatial_weight": spatial_weight,
+            "fft_weight":     fft_weight,
         }
 
 
@@ -203,26 +301,36 @@ DeepfakeGradCAM = DualBranchGradCAM
 def _run_gradcam(
     gradcam: Optional[DualBranchGradCAM],
     face_tensor: torch.Tensor,
-) -> tuple[
-    Optional[np.ndarray],
-    Optional[np.ndarray],
-    Optional[np.ndarray],
-    Optional[str],
-]:
+) -> dict[str, object]:
     """
-    Safely execute Grad-CAM and unpack results.
+    Safely execute Grad-CAM and return a flat dict of result keys.
 
-    Returns (combined, spatial, fft, error_message).
-    On failure returns (None, None, None, error_string) so calling functions
-    remain clean without nested try/except blocks.
+    Returns a dict with keys: heatmap, spatial_heatmap, fft_heatmap,
+    spatial_weight, fft_weight, gradcam_error.  All values are None when
+    Grad-CAM is disabled or generation fails, so callers can spread this
+    directly into their result dict without branching on success/failure.
+
+    Named dict keys (vs. a positional tuple) avoid silent argument-order
+    bugs if the return shape ever changes again.
     """
+    empty: dict[str, object] = {
+        "heatmap": None, "spatial_heatmap": None, "fft_heatmap": None,
+        "spatial_weight": None, "fft_weight": None, "gradcam_error": None,
+    }
     if gradcam is None:
-        return None, None, None, None
+        return empty
     try:
         out = gradcam.generate(face_tensor)
-        return out["combined"], out["spatial"], out["fft"], None
+        return {
+            "heatmap":         out["combined"],
+            "spatial_heatmap": out["spatial"],
+            "fft_heatmap":     out["fft"],
+            "spatial_weight":  out["spatial_weight"],
+            "fft_weight":      out["fft_weight"],
+            "gradcam_error":   None,
+        }
     except Exception as exc:
-        return None, None, None, f"Grad-CAM unavailable: {exc}"
+        return {**empty, "gradcam_error": f"Grad-CAM unavailable: {exc}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,16 +375,13 @@ def predict_image(
     label      = "FAKE" if prob > 0.5 else "REAL"
     confidence = prob if label == "FAKE" else (1.0 - prob)
 
-    combined, spatial_hm, fft_hm, cam_err = _run_gradcam(gradcam, face_tensor)
+    combined_result = _run_gradcam(gradcam, face_tensor)
 
     return {
-        "label":           label,
-        "confidence":      confidence,
-        "face":            face,
-        "heatmap":         combined,       # blended (primary display)
-        "spatial_heatmap": spatial_hm,
-        "fft_heatmap":     fft_hm,
-        "gradcam_error":   cam_err,
+        "label":      label,
+        "confidence": confidence,
+        "face":       face,
+        **combined_result,   # heatmap, spatial_heatmap, fft_heatmap, spatial_weight, fft_weight, gradcam_error
     }
 
 
@@ -365,17 +470,14 @@ def predict_video(
     mid_idx    = len(frames) // 2
     mid_tensor = frames[mid_idx].unsqueeze(0).to(device)               # [1,C,H,W]
 
-    combined, spatial_hm, fft_hm, cam_err = _run_gradcam(gradcam, mid_tensor)
+    combined_result = _run_gradcam(gradcam, mid_tensor)
 
     return {
-        "label":           label,
-        "confidence":      confidence,
-        "face":            face_crops[mid_idx],
-        "heatmap":         combined,
-        "spatial_heatmap": spatial_hm,
-        "fft_heatmap":     fft_hm,
-        "gradcam_error":   cam_err,
-        "warning":         warning,
+        "label":      label,
+        "confidence": confidence,
+        "face":       face_crops[mid_idx],
+        "warning":    warning,
+        **combined_result,   # heatmap, spatial_heatmap, fft_heatmap, spatial_weight, fft_weight, gradcam_error
     }
 
 
@@ -436,9 +538,7 @@ if __name__ == "__main__":
     if not os.path.exists(WEIGHTS_PATH):
         print(f"Error: Weights not found at {WEIGHTS_PATH}")
     else:
-        detector.load_state_dict(
-            torch.load(WEIGHTS_PATH, map_location=DEVICE, weights_only=True)
-        )
+        load_checkpoint(detector, WEIGHTS_PATH, DEVICE)
         print(f"\nAnalyzing: {os.path.basename(INPUT_PATH)}")
         result = predict(
             INPUT_PATH, detector, face_extractor, val_transform, DEVICE, SEQ_LENGTH

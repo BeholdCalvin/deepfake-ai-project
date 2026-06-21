@@ -27,7 +27,7 @@ from sklearn.metrics import (
 
 from dataloaders.dataset import DeepfakeSequenceDataset
 from dataloaders.transforms import get_val_transforms
-from models.fusion import DeepfakeDetector
+from models.fusion import DeepfakeDetector, load_checkpoint
 from utils.metrics import calculate_metrics
 
 
@@ -90,9 +90,11 @@ def main():
         lstm_layers=config.get("lstm_layers", 2),
     ).to(device)
 
-    checkpoint = torch.load(config["weights_path"], map_location=device)
-    model.load_state_dict(checkpoint)
-    model.eval()
+    # load_checkpoint() tolerates the known legacy Grad-CAM alias keys from a
+    # transitional version of fusion.py (see models/fusion.py) while still
+    # raising loudly (strict=True) on any genuine architecture mismatch.
+    # It also calls model.eval() internally.
+    load_checkpoint(model, config["weights_path"], device)
 
     # ── Inference loop ────────────────────────────────────────────────────────
     all_labels: list[float] = []

@@ -67,20 +67,48 @@ class FaceExtractor:
         device: str      = "cuda",
         margin: float    = 0.3,
         output_size: int = 224,
+        align_mode: str  = "landmarks",
     ) -> None:
         """
         Args:
             device:      Preferred compute device ('cuda' or 'cpu').
                          Automatically falls back to CPU when CUDA unavailable.
             margin:      Fractional padding added around bounding boxes in the
-                         fallback crop path (0.3 = 30 % on each side).
+                         fallback / bbox crop path (0.3 = 30 % on each side).
             output_size: Side length in pixels of the returned square crop.
+            align_mode:  'landmarks' (default) – similarity-transform alignment
+                         using 5-point keypoints, falling back to bbox crop
+                         only when landmarks fail.
+                         'bbox' – always use the plain margin-padded bounding-
+                         box crop (the original, pre-alignment behaviour),
+                         even when landmarks are available.
+
+                         WHY THIS EXISTS: if a model was trained on faces
+                         extracted with the OLD bbox-only logic, switching the
+                         live inference pipeline to landmark alignment changes
+                         the face framing/scale/rotation distribution it sees.
+                         A CNN that has never seen that distribution can
+                         degrade toward an uninformative ~0.5 confidence on
+                         every input — a train/serve skew bug that looks
+                         identical to "the model never learned anything."
+                         Setting align_mode="bbox" reproduces the exact
+                         original crop so you can A/B test this in minutes;
+                         see diagnose_predictions.py for an automated check.
         """
+        if align_mode not in ("landmarks", "bbox"):
+            raise ValueError(
+                f"align_mode must be 'landmarks' or 'bbox', got {align_mode!r}"
+            )
+
         self.device      = torch.device(device if torch.cuda.is_available() else "cpu")
         self.margin      = margin
         self.output_size = output_size
+        self.align_mode  = align_mode
 
-        print(f"[FaceExtractor] device={self.device}, output_size={self.output_size}")
+        print(
+            f"[FaceExtractor] device={self.device}, output_size={self.output_size}, "
+            f"align_mode={self.align_mode!r}"
+        )
 
         # keep_all=False + select_largest=True: return only the most prominent
         # face per frame.  Avoids multi-face index tracking in talking-head
@@ -129,7 +157,11 @@ class FaceExtractor:
             face: np.ndarray | None = None
 
             # ── Preferred path: landmark-based affine alignment ───────────
-            if lm is not None:
+            # Only attempted in "landmarks" mode. In "bbox" mode we skip this
+            # entirely so the output is bit-for-bit the legacy crop, even if
+            # MTCNN successfully returned landmarks — this is what makes
+            # align_mode="bbox" a true A/B baseline rather than a fallback.
+            if self.align_mode == "landmarks" and lm is not None:
                 try:
                     # lm shape: [n_faces, 5, 2]; index [0] is the top-1 face.
                     keypoints = lm[0].astype(np.float32)               # [5, 2]
@@ -138,6 +170,8 @@ class FaceExtractor:
                     face = None  # fall through to bounding-box path
 
             # ── Fallback path: margin-padded bounding-box crop ────────────
+            # Reached when align_mode="bbox", OR when landmarks failed/were
+            # unavailable, OR when the affine estimation degenerated.
             if face is None:
                 face = self._crop_bbox(frame, box[0])
 

@@ -19,7 +19,6 @@ Run with:
 
 import os
 import tempfile
-from xml.parsers.expat import model
 
 import cv2
 import numpy as np
@@ -28,7 +27,7 @@ import torch
 from PIL import Image
 
 from dataloaders.transforms import get_val_transforms
-from models.fusion import DeepfakeDetector
+from models.fusion import DeepfakeDetector, load_checkpoint
 # DualBranchGradCAM is instantiated *inside* predict(); app.py never needs it directly.
 from predict import predict
 from utils.face_extractor import FaceExtractor
@@ -38,7 +37,7 @@ from utils.face_extractor import FaceExtractor
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-WEIGHTS_PATH   = "weights/best_model.pth"
+WEIGHTS_PATH   = "weights/deepfake_model_ep9.pth"
 SEQ_LENGTH     = 8
 IMG_SIZE       = 224
 DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -55,6 +54,11 @@ def load_model() -> DeepfakeDetector:
     Load EfficientNet-B4 + FFT fusion model from disk.
     @st.cache_resource ensures weights are loaded exactly once per process,
     even when multiple browser sessions are connected simultaneously.
+
+    Uses models.fusion.load_checkpoint(), which tolerates the known legacy
+    Grad-CAM alias keys from a transitional version of this model (see
+    fusion.py) while still raising loudly on any genuine architecture
+    mismatch.
     """
     model = DeepfakeDetector(sequence_length=SEQ_LENGTH).to(DEVICE)
 
@@ -65,21 +69,19 @@ def load_model() -> DeepfakeDetector:
         )
         st.stop()
 
-    state_dict = torch.load(
-        WEIGHTS_PATH,
-        map_location=DEVICE,
-        weights_only=True
-    )
-
-    model.load_state_dict(state_dict, strict=False)
-
-    model.eval()
+    load_checkpoint(model, WEIGHTS_PATH, DEVICE)
     return model
 
 
 @st.cache_resource(show_spinner=False)
-def load_extractor() -> FaceExtractor:
-    return FaceExtractor()
+def load_extractor(align_mode: str) -> FaceExtractor:
+    """
+    align_mode is passed through to FaceExtractor and is part of this
+    function's @st.cache_resource key, so switching the sidebar toggle
+    creates (and reuses) a separate cached extractor per mode instead of
+    silently reusing a stale one.
+    """
+    return FaceExtractor(align_mode=align_mode)
 
 
 @st.cache_resource(show_spinner=False)
@@ -131,9 +133,16 @@ def _side_by_side(
     heatmap: np.ndarray | None,
     spatial_heatmap: np.ndarray | None = None,
     fft_heatmap: np.ndarray | None = None,
+    spatial_weight: float | None = None,
+    fft_weight: float | None = None,
 ) -> None:
     """
     Show the analysed face crop alongside the combined Grad-CAM overlay.
+
+    spatial_weight / fft_weight are this SAMPLE's measured contribution
+    (Grad×Input attribution at the fusion layer — see predict.py), not a
+    fixed prior, so the caption always reflects what actually drove this
+    specific prediction.
 
     When dual-branch heatmaps are available they are rendered in a collapsible
     expander so the primary view stays uncluttered while power users can still
@@ -149,9 +158,16 @@ def _side_by_side(
         if heatmap is not None:
             st.markdown("**Grad-CAM Heatmap (Combined)**")
             st.image(heatmap, use_container_width=True)
+            if spatial_weight is not None and fft_weight is not None:
+                blend_caption = (
+                    f"Blended from spatial branch ({spatial_weight * 100:.0f} %) "
+                    f"+ frequency branch ({fft_weight * 100:.0f} %) — measured for "
+                    f"this image, not a fixed split."
+                )
+            else:
+                blend_caption = "Blended from the spatial and frequency branches."
             st.caption(
-                "🔴 Red / warm = high activation (suspicious region).  "
-                "Blended from spatial branch (65 %) + frequency branch (35 %)."
+                f"🔴 Red / warm = high activation (suspicious region).  {blend_caption}"
             )
         else:
             st.info("Grad-CAM not available for this input.")
@@ -162,12 +178,18 @@ def _side_by_side(
             b1, b2 = st.columns(2)
             with b1:
                 if spatial_heatmap is not None:
-                    st.markdown("**Spatial Branch**")
+                    label = "**Spatial Branch**"
+                    if spatial_weight is not None:
+                        label += f"  ·  {spatial_weight * 100:.0f}% contribution"
+                    st.markdown(label)
                     st.image(spatial_heatmap, use_container_width=True)
                     st.caption("Blending / texture artefacts at jaw, eyes, hairline.")
             with b2:
                 if fft_heatmap is not None:
-                    st.markdown("**Frequency Branch**")
+                    label = "**Frequency Branch**"
+                    if fft_weight is not None:
+                        label += f"  ·  {fft_weight * 100:.0f}% contribution"
+                    st.markdown(label)
                     st.image(fft_heatmap, use_container_width=True)
                     st.caption("Spectral GAN fingerprints: grid / ring patterns.")
 
@@ -200,6 +222,20 @@ def main() -> None:
             min_value=4, max_value=16, value=SEQ_LENGTH, step=2,
         )
         st.markdown("---")
+        align_mode = st.radio(
+            "Face crop mode",
+            options=["landmarks", "bbox"],
+            index=0,
+            help=(
+                "'landmarks' = similarity-transform aligned crop (current default). "
+                "'bbox' = legacy margin-padded bounding-box crop, no alignment. "
+                "If predictions look uncalibrated (e.g. stuck near 50%), the model "
+                "may have been trained on 'bbox'-style crops — switch here to "
+                "A/B test without changing code. See diagnose_predictions.py for "
+                "an automated version of this check."
+            ),
+        )
+        st.markdown("---")
         st.markdown(
             f"**Device:** `{DEVICE}`  \n"
             f"**Model:** EfficientNet-B4 + FFT  \n"
@@ -208,7 +244,7 @@ def main() -> None:
 
     # ── Load resources ────────────────────────────────────────────────────────
     model     = load_model()
-    extractor = load_extractor()
+    extractor = load_extractor(align_mode)
     transform = load_transform()
 
     # ── Upload widget ─────────────────────────────────────────────────────────
@@ -295,6 +331,8 @@ def main() -> None:
             heatmap,
             spatial_heatmap=result.get("spatial_heatmap"),
             fft_heatmap=result.get("fft_heatmap"),
+            spatial_weight=result.get("spatial_weight"),
+            fft_weight=result.get("fft_weight"),
         )
 
     # ── Interpretation guide ──────────────────────────────────────────────────
