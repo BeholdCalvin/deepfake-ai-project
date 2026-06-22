@@ -8,6 +8,7 @@ runs/
 outputs/
 checkpoints/
 *.log
+weights/*.pth
 
 # Python cache and build artifacts
 __pycache__/
