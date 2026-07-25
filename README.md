@@ -13,7 +13,7 @@ Most deepfake detectors rely on a single stream of evidence. This project fuses 
 - **Spatial Branch (EfficientNet-B4)** — detects pixel-level artefacts: soft jaw edges, skin texture mismatches, and blending boundaries that GAN face-swaps leave behind.
 - **Frequency Branch (FFT-CNN)** — detects spectral fingerprints: the periodic grid patterns and ring artefacts introduced by GAN up-sampling, which survive JPEG re-encoding and social-media compression.
 
-Frame-level features from both branches are fused and passed through a **bidirectional-ready LSTM**, allowing the model to reason across temporal sequences in video rather than evaluating each frame independently.
+Frame-level features from both branches are fused and passed through an **LSTM**, allowing the model to reason across temporal sequences in video rather than evaluating each frame independently.
 
 ---
 

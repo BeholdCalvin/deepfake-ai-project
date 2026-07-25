@@ -1,7 +1,7 @@
 # Data
 data_dir: "./data/processed/train"
 val_data_dir: "./data/processed/test"
-sequence_length: 5 # Number of frames per video to process in sequence
+sequence_length: 8 # Number of frames per video to process in sequence
 image_size: 224
 
 # Training
